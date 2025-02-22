@@ -31,7 +31,7 @@ Internationalization support - [Template with i18n](https://tailwind-nextjs-star
 
 ## Examples V2
 
-- [Demo Blog](https://tailwind-nextjs-starter-blog.vercel.app/) - this repo
+- [Demo Blog](https://jane-wang.vercel.app/) - this repo
 - [My personal blog](https://www.cnblogs.com/jane315) - modified to auto-generate blog posts with dates
 - [Karhdo's Blog](https://karhdo.dev) - Karhdo's Blog - Karhdo's Coding Adventure ([source code](https://github.com/Karhdo/karhdo.dev))
 - [tsix blog](https://tsix.top) - A front-end engineer is used to record some knowledge points in work and study _中文_
@@ -162,12 +162,12 @@ I wanted it to be nearly as feature-rich as popular blogging templates like [bea
 
 ## Sample posts
 
-- [A markdown guide](https://tailwind-nextjs-starter-blog.vercel.app/blog/github-markdown-guide)
-- [Learn more about images in Next.js](https://tailwind-nextjs-starter-blog.vercel.app/blog/guide-to-using-images-in-nextjs)
-- [A tour of math typesetting](https://tailwind-nextjs-starter-blog.vercel.app/blog/deriving-ols-estimator)
-- [Simple MDX image grid](https://tailwind-nextjs-starter-blog.vercel.app/blog/pictures-of-canada)
-- [Example of long prose](https://tailwind-nextjs-starter-blog.vercel.app/blog/the-time-machine)
-- [Example of Nested Route Post](https://tailwind-nextjs-starter-blog.vercel.app/blog/nested-route/introducing-multi-part-posts-with-nested-routing)
+- [A markdown guide](https://jane-wang.vercel.app/blog/github-markdown-guide)
+- [Learn more about images in Next.js](https://jane-wang.vercel.app/blog/guide-to-using-images-in-nextjs)
+- [A tour of math typesetting](https://jane-wang.vercel.app/blog/deriving-ols-estimator)
+- [Simple MDX image grid](https://jane-wang.vercel.app/blog/pictures-of-canada)
+- [Example of long prose](https://jane-wang.vercel.app/blog/the-time-machine)
+- [Example of Nested Route Post](https://jane-wang.vercel.app/blog/nested-route/introducing-multi-part-posts-with-nested-routing)
 
 ## Quick Start Guide
 
@@ -279,7 +279,7 @@ summary: 'Looking for a performant, out of the box template, with all the best i
 images: ['/static/images/canada/mountains.jpg', '/static/images/canada/toronto.jpg']
 authors: ['default', 'sparrowhawk']
 layout: PostLayout
-canonicalUrl: https://tailwind-nextjs-starter-blog.vercel.app/blog/introducing-tailwind-nextjs-starter-blog
+canonicalUrl: https://jane-wang.vercel.app/blog/introducing-tailwind-nextjs-starter-blog
 ---
 ```
 
