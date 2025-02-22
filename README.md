@@ -4,7 +4,7 @@
 
 [![GitHub Repo stars](https://img.shields.io/github/stars/jane-315/blog?style=social)](https://GitHub.com/jane-315/blog/stargazers/)
 [![GitHub forks](https://img.shields.io/github/forks/jane-315/blog?style=social)](https://github.com/jane-315/blog/forks)
-[![Twitter URL](https://img.shields.io/twitter/url?style=social&url=https%3A%2F%2Ftwitter.com%2Fjanewang)](https://x.com/janewang)
+[![Twitter URL](https://img.shields.io/twitter/url?style=social&url=https%3A%2F%2Ftwitter.com%2Fjan3wang)](https://x.com/janewang)
 [![Sponsor](https://img.shields.io/static/v1?label=Sponsor&message=%E2%9D%A4&logo=GitHub&link=https://github.com/sponsors/jane-315)](https://github.com/sponsors/jane-315)
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/git/external?repository-url=https://github.com/jane-315/blog)
