@@ -1,0 +1,123 @@
+---
+title: 'Dm-crypt Workflow'
+date: '2024-12-11'
+tags: ['dm-crypt']
+draft: false
+layout: PostBanner
+images: ['/static/images/banner.png']
+summary: workflow of dm-crypt.
+---
+有关dm-crypt的数据结构及之间的关联
+![workflow-1](/static/images/dm-crypt/workflow-1.png)
+有关dm-crypt I/O请求流程
+![workflow-1](/static/images/dm-crypt/workflow-2.png)
+
+```c++
+name         : __xts(aes)
+driver       : cryptd(__xts-aes-aesni)
+module       : cryptd
+priority     : 451
+refcnt       : 2
+selftest     : passed
+internal     : yes
+type         : skcipher
+async        : yes
+blocksize    : 16
+min keysize  : 32
+max keysize  : 64
+ivsize       : 16
+chunksize    : 16
+walksize     : 16
+
+
+name         : xts(aes)
+driver       : xts-aes-aesni
+module       : aesni_intel
+priority     : 401
+refcnt       : 2
+selftest     : passed
+internal     : no
+type         : skcipher
+async        : yes
+blocksize    : 16
+min keysize  : 32
+max keysize  : 64
+ivsize       : 16
+chunksize    : 16
+walksize     : 16
+
+
+name         : __xts(aes)
+driver       : __xts-aes-aesni
+module       : aesni_intel
+priority     : 401
+refcnt       : 3
+selftest     : passed
+internal     : yes
+type         : skcipher
+async        : no
+blocksize    : 16
+min keysize  : 32
+max keysize  : 64
+ivsize       : 16
+chunksize    : 16
+walksize     : 32
+
+name         : aes
+driver       : aes-aesni
+module       : aesni_intel
+priority     : 300
+refcnt       : 1
+selftest     : passed
+internal     : no
+type         : cipher
+blocksize    : 16
+min keysize  : 16
+max keysize  : 32
+```
+
+据 /proc/crypto 信息中的关键字段分析：
+| Name       | Driver                   | Async | Internal | 优先级 | 性能分析                                                                 |
+|------------|--------------------------|-------|----------|--------|--------------------------------------------------------------------------|
+| xts(aes)   | xts-aes-aesni            | Yes   | No       | 401    | 最佳性能：直接硬件加速，支持异步操作，适合高性能需求。                   |
+| __xts(aes) | __xts-aes-aesni          | No    | Yes      | 401    | 次优性能：同步硬件加速，适合单线程场景。                                 |
+| __xts(aes) | cryptd(__xts-aes-aesni)  | Yes   | Yes      | 451    | 多线程高效：硬件加速 + cryptd 优化，适合高并发任务。                     |
+| aes        | aes-aesni                | No    | No       | 300    | 较差性能：单块硬件加速，加密模式有限。                                   |
+| aes        | aes-generic              | No    | No       | 100    | 最差性能：完全软件实现，仅用于无硬件加速时作为后备。                     |
+
+```c
+# 测试1：小块随机读写（模拟数据库类工作负载）
+sudo fio --filename=/dev/mapper/enc_test --direct=1 --rw=randrw \
+  --bs=4k --ioengine=libaio --iodepth=32 --runtime=30 \
+  --numjobs=8 --time_based --group_reporting --name=small-random \
+  --eta-newline=1
+
+# 测试2：中等块大小顺序读写（模拟日志写入）
+sudo fio --filename=/dev/mapper/enc_test --direct=1 --rw=rw \
+  --bs=64k --ioengine=libaio --iodepth=16 --runtime=30 \
+  --numjobs=4 --time_based --group_reporting --name=medium-mixed \
+  --eta-newline=1
+
+# 测试3：大块顺序写入（模拟大文件传输）
+sudo fio --filename=/dev/mapper/enc_test --direct=1 --rw=write \
+  --bs=1M --ioengine=libaio --iodepth=8 --runtime=30 \
+  --numjobs=2 --time_based --group_reporting --name=large-sequential \
+  --eta-newline=1
+# 测试1：小块随机读写（模拟数据库类工作负载）
+sudo fio --filename=/dev/mapper/enc_test1 --direct=1 --rw=randrw \
+  --bs=4k --ioengine=libaio --iodepth=32 --runtime=30 \
+  --numjobs=8 --time_based --group_reporting --name=small-random \
+  --eta-newline=1
+
+# 测试2：中等块大小顺序读写（模拟日志写入）
+sudo fio --filename=/dev/mapper/enc_test1 --direct=1 --rw=rw \
+  --bs=64k --ioengine=libaio --iodepth=16 --runtime=30 \
+  --numjobs=4 --time_based --group_reporting --name=medium-mixed \
+  --eta-newline=1
+
+# 测试3：大块顺序写入（模拟大文件传输）
+sudo fio --filename=/dev/mapper/enc_test1 --direct=1 --rw=write \
+  --bs=1M --ioengine=libaio --iodepth=8 --runtime=30 \
+  --numjobs=2 --time_based --group_reporting --name=large-sequential \
+  --eta-newline=1
+```

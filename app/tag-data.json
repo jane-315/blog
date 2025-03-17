@@ -1,4 +1,7 @@
 {
+  "fuse": 3,
+  "dm-crypt": 2,
+  "veracrypt": 1,
   "next-js": 6,
   "tailwind": 3,
   "guide": 5,

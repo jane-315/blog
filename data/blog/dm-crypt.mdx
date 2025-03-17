@@ -1,0 +1,308 @@
+---
+title: 'Dm Crypt'
+date: '2024-11-27'
+tags: ['dm-crypt']
+draft: false
+layout: PostBanner
+images: ['/static/images/banner.png']
+summary: dm-crypt.
+---
+ 初始化流程（完善版）
+ 
+![图片](/static/images/dm-crypt/image-1.png)
+```
+graph TD
+    A[module_init<br/>模块初始化入口] --> B[crypt_ctr<br/>设备映射构造器]
+    
+    B --> C1[基础内存分配<br/>为加密配置分配内存]
+    B --> C2[crypt_ctr_optional<br/>处理可选参数:<br/>1.丢弃支持<br/>2.CPU亲和性<br/>3.完整性校验<br/>4.扇区大小]
+    B --> C3[crypt_ctr_cipher<br/>加密算法设置]
+    
+    C3 --> D1[crypt_ctr_cipher_new<br/>新格式密钥:<br/>:key_size:user:description]
+    C3 --> D2[crypt_ctr_cipher_old<br/>旧格式密钥:<br/>直接密钥字符串]
+    
+    D1 --> E[crypt_alloc_tfms<br/>分配转换函数]
+    D2 --> E
+    
+    E --> F1[crypt_alloc_tfms_skcipher<br/>对称加密:<br/>1.AES<br/>2.Blowfish<br/>3.Twofish等]
+    E --> F2[crypt_alloc_tfms_aead<br/>认证加密:<br/>1.GCM模式<br/>2.CCM模式<br/>3.带MAC的加密]
+    
+    B --> G[工作队列初始化<br/>处理异步操作]
+    G --> G1[io_queue<br/>IO请求队列:<br/>处理读写请求]
+    G --> G2[crypt_queue<br/>加密队列:<br/>处理加密解密]
+    G --> G3[write_thread<br/>写线程:<br/>处理写入操作]
+
+    B --> H[IV初始化<br/>初始化向量设置]
+    H --> H1[plain<br/>普通IV]
+    H --> H2[essiv<br/>加盐IV]
+    H --> H3[benbi<br/>大端递增IV]
+    H --> H4[null<br/>零IV]
+
+    B --> I[完整性初始化<br/>数据完整性保护]
+    I --> I1[HMAC<br/>哈希消息认证]
+    I --> I2[CMAC<br/>密码消息认证]
+    I --> I3[GMAC<br/>伽罗瓦消息认证]
+```
+关键概念解释：
+密钥格式：
+  - 新格式：:key_size:user:description
+  - key_size：密钥大小
+  - user：用户空间密钥
+  - description：密钥描述符
+  - 旧格式：直接提供密钥字符串
+加密类型：
+- 对称加密(skcipher)：
+  - 使用相同的密钥加密解密
+  - 常见算法：AES、Blowfish、Twofish
+  - 适用于大量数据加密
+- 认证加密(AEAD)：
+  - Authenticated Encryption with Associated Data
+  - 同时提供加密和认证
+  - 可以检测数据篡改
+  - 常见模式：GCM、CCM
+初始化向量(IV)：
+  - plain：使用扇区号作为IV
+  - essiv：使用加盐的哈希值作为IV
+  - benbi：使用大端格式递增的IV
+  - null：使用全零IV
+完整性保护：
+  - HMAC：基于哈希的消息认证码
+  - CMAC：基于密码的消息认证码
+  - GMAC：基于伽罗瓦域的消息认证码
+读请求处理流程（完善版）
+![图片](/static/images/dm-crypt/image-2.png)
+
+![图片](/static/images/dm-crypt/image-3.png)
+mermaid
+```
+sequenceDiagram
+    participant Bio as 块层
+    participant Map as crypt_map
+    participant IO as kcryptd_io_read
+    participant Convert as kcryptd_crypt_read_convert
+    participant Crypto as crypt_convert
+    participant Complete as kcryptd_crypt_read_done
+    participant Integrity as 完整性校验
+
+    Bio->>Map: bio请求
+    Note over Map: 1. 检查bio合法性<br>2. 验证扇区边界<br>3. 检查设备状态
+    
+    Map->>Map: crypt_io_init初始化
+    Note over Map: 1. 分配IO上下文<br>2. 设置加密参数<br>3. 初始化完整性数据
+
+    Map->>IO: kcryptd_io_read
+    Note over IO: 1. 计算偏移量<br>2. 设置DMA映射<br>3. 选择处理模式
+    
+    alt 直接处理
+        IO->>Convert: 同步处理
+    else 队列处理
+        IO->>IO: kcryptd_queue_read
+        Note over IO: 1. 加入工作队列<br>2. 设置回调函数
+        IO->>Convert: 异步处理
+    end
+    
+    Convert->>Integrity: 完整性预检
+    Note over Integrity: 1. 验证HMAC<br>2. 检查标签<br>3. 验证扇区号
+
+    Convert->>Crypto: crypt_convert
+    Note over Crypto: 1. 生成IV<br>2. 设置解密参数<br>3. 执行解密操作
+    
+    Crypto->>Complete: 完成处理
+    Note over Complete: 1. 清理资源<br>2. 更新统计信息<br>3. 调用完成回调
+
+    Complete->>Bio: 返回结果
+```
+```
+graph TD
+    subgraph UserSpace[用户空间]
+        App[应用程序]
+        Key[密钥管理]
+    end
+
+    subgraph KernelSpace[内核空间]
+        subgraph VFS[虚拟文件系统]
+            ReadReq[读取请求]
+        end
+
+        subgraph Cache[缓存层]
+            PageCache[页面缓存]
+        end
+
+        subgraph DeviceMapper[设备映射层]
+            DMCore[DM核心]
+            DMCrypt[dm-crypt模块]
+            KeyMgmt[密钥管理模块]
+        end
+
+        subgraph BlockLayer[块层]
+            BIO[bio请求]
+            IOSched[IO调度器]
+        end
+    end
+
+    subgraph Storage[存储层]
+        BlockDev[块设备]
+    end
+
+    %% 数据流向
+    App -->|系统调用| ReadReq
+    ReadReq -->|查找| PageCache
+    PageCache -->|缓存未命中| DMCore
+    DMCore -->|路由请求| DMCrypt
+    Key -->|提供密钥| KeyMgmt
+    KeyMgmt -->|密钥使用| DMCrypt
+    DMCrypt -->|解密请求| BIO
+    BIO -->|调度| IOSched
+    IOSched -->|读取| BlockDev
+    BlockDev -->|加密数据| DMCrypt
+    DMCrypt -->|解密数据| PageCache
+    PageCache -->|返回数据| App
+
+    %% 样式
+    classDef userSpace fill:#e6f3ff,stroke:#333,stroke-width:2px;
+    classDef kernelSpace fill:#f9f9f9,stroke:#666;
+    classDef storage fill:#ffe6e6,stroke:#333;
+    
+    class UserSpace userSpace;
+    class KernelSpace kernelSpace;
+    class Storage storage;
+```
+写请求处理流程（完善版）
+![图片](/static/images/dm-crypt/image-4.png)
+
+![图片](/static/images/dm-crypt/image-5.png)
+mermaid
+```
+sequenceDiagram
+    participant Bio as 块层
+    participant Map as crypt_map
+    participant Queue as kcryptd_queue_crypt
+    participant Convert as kcryptd_crypt_write_convert
+    participant Crypto as crypt_convert
+    participant Integrity as 完整性处理
+    participant Submit as kcryptd_crypt_write_io_submit
+    participant Write as dmcrypt_write
+
+    Bio->>Map: bio请求
+    Note over Map: 1. 验证请求参数<br>2. 检查设备状态<br>3. 分配资源
+
+    Map->>Queue: kcryptd_queue_crypt
+    Note over Queue: 1. 初始化工作<br>2. 设置优先级<br>3. 加入队列
+
+    Queue->>Convert: 处理请求
+    Note over Convert: 1. 分配缓冲区<br>2. 设置DMA映射<br>3. 准备加密
+
+    Convert->>Crypto: crypt_convert
+    Note over Crypto: 1. 生成IV<br>2. 设置加密参数<br>3. 执行加密
+
+    Crypto->>Integrity: 生成完整性数据
+    Note over Integrity: 1. 计算HMAC<br>2. 生成标签<br>3. 附加到数据
+
+    Integrity->>Submit: 提交IO
+    Note over Submit: 1. 验证结果<br>2. 设置bio参数<br>3. 准备写入
+
+    Submit->>Write: 执行写入
+    Note over Write: 1. 执行DMA传输<br>2. 更新统计信息<br>3. 处理完成回调
+
+    Write->>Bio: 完成写入
+```
+```
+graph TD
+    subgraph UserSpace[用户空间]
+        App[应用程序]
+        Key[密钥管理]
+    end
+
+    subgraph KernelSpace[内核空间]
+        subgraph VFS[虚拟文件系统]
+            WriteReq[写入请求]
+        end
+
+        subgraph Cache[缓存层]
+            PageCache[页面缓存]
+            WriteBack[回写机制]
+        end
+
+        subgraph DeviceMapper[设备映射层]
+            DMCore[DM核心]
+            DMCrypt[dm-crypt模块]
+            KeyMgmt[密钥管理模块]
+            IntegrityCheck[完整性检查]
+        end
+
+        subgraph BlockLayer[块层]
+            BIO[bio请求]
+            IOSched[IO调度器]
+            Merge[请求合并]
+        end
+    end
+
+    subgraph Storage[存储层]
+        BlockDev[块设备]
+    end
+
+    %% 数据流向
+    App -->|系统调用| WriteReq
+    WriteReq -->|写入| PageCache
+    Key -->|提供密钥| KeyMgmt
+    PageCache -->|刷新| WriteBack
+    WriteBack -->|写出| DMCore
+    DMCore -->|路由请求| DMCrypt
+    KeyMgmt -->|密钥使用| DMCrypt
+    DMCrypt -->|加密数据| IntegrityCheck
+    IntegrityCheck -->|添加校验| BIO
+    BIO -->|合并请求| Merge
+    Merge -->|调度| IOSched
+    IOSched -->|写入| BlockDev
+
+    %% 样式
+    classDef userSpace fill:#e6f3ff,stroke:#333,stroke-width:2px;
+    classDef kernelSpace fill:#f9f9f9,stroke:#666;
+    classDef storage fill:#ffe6e6,stroke:#333;
+    
+    class UserSpace userSpace;
+    class KernelSpace kernelSpace;
+    class Storage storage;
+```
+密钥管理关系
+![图片](/static/images/dm-crypt/image-6.png)
+
+mermaid
+```
+graph TD
+    subgraph UserSpace[用户空间]
+        KeyUtil[密钥工具]
+        DMSetup[dmsetup工具]
+        LUKS[LUKS工具]
+    end
+
+    subgraph KernelSpace[内核空间]
+        subgraph KeyRing[密钥环系统]
+            SysKeyring[系统密钥环]
+            UserKeyring[用户密钥环]
+            SessionKeyring[会话密钥环]
+        end
+
+        subgraph DeviceMapper[设备映射层]
+            DMCrypt[dm-crypt模块]
+            KeyMgmt[密钥管理模块]
+            KeyCache[密钥缓存]
+        end
+    end
+
+    %% 关系连接
+    KeyUtil -->|添加密钥| UserKeyring
+    DMSetup -->|配置| DMCrypt
+    LUKS -->|密钥管理| KeyUtil
+    UserKeyring -->|访问| SessionKeyring
+    SessionKeyring -->|提供| KeyMgmt
+    KeyMgmt -->|缓存| KeyCache
+    KeyCache -->|使用| DMCrypt
+
+    %% 样式
+    classDef userSpace fill:#e6f3ff,stroke:#333,stroke-width:2px;
+    classDef kernelSpace fill:#f9f9f9,stroke:#666;
+    
+    class UserSpace userSpace;
+    class KernelSpace kernelSpace;
+```

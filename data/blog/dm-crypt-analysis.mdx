@@ -1,0 +1,979 @@
+---
+title: 'Dm Crypt Analysis'
+date: '2024-12-22'
+tags: ['dm-crypt']
+draft: false
+layout: PostBanner
+images: ['/static/images/banner.png']
+summary: dm-crypt source code analysis.
+---
+
+
+IV问题
+```c++
+    iv = iv_of_dmreq(cc, dmreq);// 获取IV
+    org_iv = org_iv_of_dmreq(cc, dmreq);// 获取原始IV
+    tag_iv = iv_tag_from_dmreq(cc, dmreq);// 获取标签IV
+```
+在dm-crypt中，这三种IV有着不同的用途和作用：
+1. IV (Initialization Vector)
+```c++
+static u8 *iv_of_dmreq(struct crypt_config *cc, struct dm_crypt_request *dmreq)
+{
+    // 返回用于实际加密操作的IV
+    if (crypt_integrity_aead(cc))
+        return (u8 *)ALIGN((unsigned long)(dmreq + 1),
+                          crypto_aead_alignmask(any_tfm_aead(cc)) + 1);
+    else
+        return (u8 *)ALIGN((unsigned long)(dmreq + 1),
+                          crypto_skcipher_alignmask(any_tfm(cc)) + 1);
+}
+```
+
+作用：用于实际的加密/解密操作
+特点：
+  是一个工作副本，会在加密过程中被修改
+  对齐以满足加密算法的要求
+  每个扇区都有唯一的IV
+2. Original IV (原始IV)
+```c++
+static u8 *org_iv_of_dmreq(struct crypt_config *cc,
+                          struct dm_crypt_request *dmreq)
+{
+    // 返回原始IV的位置
+    return iv_of_dmreq(cc, dmreq) + cc->iv_size;
+}
+```
+作用：保存IV的原始值
+特点：
+  作为IV的备份
+  在需要时用于恢复或验证
+  在整个加密过程中保持不变
+3. Tag IV (标签IV)
+```c++
+static void *iv_tag_from_dmreq(struct crypt_config *cc,
+                              struct dm_crypt_request *dmreq)
+{
+    // 返回与完整性标签相关的IV
+    return tag_from_dmreq(cc, dmreq) + cc->integrity_tag_size;
+}
+```
+作用：用于数据完整性验证
+特点：
+  与完整性标签一起使用
+  存储在元数据中
+  用于AEAD（认证加密）模式
+扇区问题
+```c++
+    sector = org_sector_of_dmreq(cc, dmreq);
+    *sector = cpu_to_le64(ctx->cc_sector - cc->iv_offset);
+```
+-  获取原始扇区用于IV生成。原始扇区是设备上的实际扇区号减去IV偏移量。
+-  IV偏移量用于处理设备分区的情况 - 例如分区从扇区2048开始，
+- 但我们希望IV从0开始生成以保持兼容性。
+- 这样即使分区起始扇区不同，相同位置的数据也会使用相同的IV进行加密。
+页面问题
+1.数据页面、标签页面、完整性页面在代码中的表示是什么？
+2.缓冲区是在何处使用，比如，是加密或者解密完毕后，将数据放至缓冲区，还是用于临时存放数据？
+3.数据页面只要分配了bio结构体就拥有吗？
+4.标签页面是一块区别于bio内存地址的新内存区域吗，标签与bio之间的关系在哪里体现
+5.内存池的作用是什么？
+1. 不同类型的页面通过不同的数据结构管理，但最终都与bio关联
+2. 缓冲区主要用于临时存放待处理的数据，避免额外的数据拷贝
+3. bio结构体需要显式分配和添加数据页面
+4. 标签页面通过bio_integrity_payload与bio关联
+5. 内存池提供了可靠的内存资源管理机制，确保系统稳定性
+数据页面
+// 数据页面 - 通过bio_vec结构体表示
+```c++
+struct bio_vec {
+    struct page *bv_page;    // 实际的页面指针
+    unsigned int bv_len;     // 数据长度
+    unsigned int bv_offset;  // 页面中的偏移量
+};
+// 在dm-crypt中的表示
+struct dm_crypt_io {
+    struct crypt_config *cc;
+    struct bio *base_bio;    // 原始bio
+    struct bio *clone;       // 克隆的bio，用于加解密
+    void *integrity_metadata;  // 完整性元数据
+    // ...其他字段
+};
+```
+  数据页面是存储实际 I/O 数据的内存页面。
+  在加密/解密过程中，数据页面通过 bio 结构体中的 bio_vec 进行管理。
+  bio_vec 是 bio 的一个成员，表示一个 I/O 向量，包含页面指针、偏移量和长度。
+标签页面
+```c++
+// 标签页面和完整性页面 - 通过bio_integrity_payload结构体表示
+struct bio_integrity_payload {
+    struct bio *bip_bio;     // 关联的bio
+    struct bvec_iter bip_iter; // 完整性数据的迭代器
+    unsigned int bip_vcnt;   // 向量计数
+    struct bio_vec *bip_vec; // 完整性数据的向量数组
+    struct work_struct bip_work; // 用于异步处理
+    struct bio_vec *bip_inline_vecs; // 内联向量
+};
+```
+  标签页面用于存储数据的完整性标签（如 MAC/HMAC）。
+  在 AEAD 模式下，标签页面存储认证标签，确保数据的完整性和真实性。
+  标签页面的大小和位置由 crypt_integrity_io_alloc 函数计算和分配
+完整性页面
+  
+  完整性页面是用于存储完整性元数据的页面。
+  这些页面通过 bio_integrity_payload 结构体进行管理。
+  bio_integrity_payload 是 bio 的一个成员，包含完整性元数据的大小和起始扇区位置。
+标签与完整性页面的关系：
+  标签页面是完整性页面的一部分，用于存储每个扇区的完整性标签。
+  bio_integrity_add_page 函数将完整性元数据添加到 bio 中
+缓冲区的使用：
+```c++
+static int crypt_convert_block_skcipher(struct crypt_config *cc,
+                                      struct convert_context *ctx,
+                                      struct skcipher_request *req,
+                                      unsigned int tag_offset)
+{
+    // 获取输入输出缓冲区
+    struct bio_vec bv_in = bio_iter_iovec(ctx->bio_in, ctx->iter_in);
+    struct bio_vec bv_out = bio_iter_iovec(ctx->bio_out, ctx->iter_out);
+    
+    // 设置散列列表（用于加解密）
+    sg_init_table(sg_in, 1);
+    sg_set_page(sg_in, bv_in.bv_page, cc->sector_size, bv_in.bv_offset);
+    
+    // 缓冲区在这里用于临时存放待加密/解密的数据
+    // 加解密直接在这些页面上进行，避免额外的数据拷贝
+}
+```
+数据页面与bio的关系：
+```c++
+static struct bio *crypt_alloc_buffer(struct dm_crypt_io *io, unsigned size)
+{
+    struct bio *clone;
+    struct page *page;
+    
+    // 1. 分配bio结构体
+    clone = bio_alloc_bioset(GFP_NOIO, nr_iovecs, &cc->bs);
+    
+    // 2. 需要显式分配页面并添加到bio
+    for (i = 0; i < nr_iovecs; i++) {
+        page = mempool_alloc(&cc->page_pool, gfp_mask);
+        if (!page)
+            goto error;
+        bio_add_page(clone, page, len, 0);
+    }
+    
+    // bio结构体本身不包含数据页面，需要显式分配和添加
+}
+```
+标签页面与bio的关系:
+```c++
+static int dm_crypt_integrity_io_alloc(struct dm_crypt_io *io, struct bio *bio)
+{
+    struct bio_integrity_payload *bip;
+    
+    // 1. 分配完整性载荷结构
+    bip = bio_integrity_alloc(bio, GFP_NOIO, 1);
+    
+    // 2. 设置标签大小和位置
+    tag_len = io->cc->on_disk_tag_size * 
+              (bio_sectors(bio) >> io->cc->sector_shift);
+    
+    // 3. 将完整性数据添加到bio中
+    // 标签页面通过bio_integrity_payload与bio关联
+    return bio_integrity_add_page(bio, 
+                                virt_to_page(io->integrity_metadata),
+                                tag_len,
+                                offset_in_page(io->integrity_metadata));
+}
+```
+内存池的作用：
+```c++
+struct crypt_config {
+    mempool_t page_pool;      // 页面内存池
+    mempool_t req_pool;       // 请求内存池
+    struct bio_set bs;        // bio集合
+    
+    // 内存池初始化
+    r = mempool_init_page_pool(&cc->page_pool, MIN_IOS, 0);
+    r = mempool_init_kmalloc_pool(&cc->req_pool, MIN_IOS, sizeof(struct skcipher_request));
+};
+
+// 内存池的主要作用：
+// 1. 预分配固定数量的内存资源，确保关键操作不会因内存不足而失败
+// 2. 提供快速的内存分配和释放机制
+// 3. 避免内存碎片化
+// 4. 支持高负载情况下的稳定性
+
+// 使用示例
+page = mempool_alloc(&cc->page_pool, gfp_mask);
+if (!page)
+    return -ENOMEM;
+
+// 使用完毕后释放
+mempool_free(page, &cc->page_pool);
+```
+dm-crypt概述
+项目结构
+dm-crypt.c 是 Linux 内核中设备映射器（Device Mapper）子系统的一部分，专门用于实现块设备的加密。它是 dm-crypt 模块的核心实现文件。以下是该文件的主要结构和组成部分：
+头文件引入：文件开头引入了大量的头文件，这些头文件提供了内核模块开发、加密操作、块设备操作、内存管理等所需的各种功能。
+数据结构定义：
+struct convert_context：用于跟踪加密/解密请求的状态和进度。
+struct dm_crypt_io：每个 I/O 请求的私有数据结构，包含加密配置、工作队列、任务队列等。
+struct dm_crypt_request：表示单个加密请求，包含输入/输出的 scatterlist 和 IV 扇区号。
+struct crypt_config：核心配置结构，包含设备信息、加密算法、IV 生成器、工作队列、内存池等。
+枚举类型：
+enum flags 和 enum cipher_flags：定义了一些标志位，用于控制加密操作的行为。
+函数声明：
+包含了许多静态函数声明，这些函数用于初始化、加密/解密、IV 生成、请求分配和释放等。
+IV 生成操作：
+定义了多种 IV 生成算法（如 plain, essiv, benbi, lmk, tcw, elephant 等），每种算法都有相应的初始化、生成、后处理函数。
+完整性扩展：
+提供了完整性检查和处理的相关函数。
+加密/解密逻辑：
+包含了加密和解密数据的核心逻辑，处理同步和异步请求。
+辅助函数：
+提供了一些辅助函数，用于内存分配、请求管理、IV 处理等。
+模块初始化和退出：
+通常在文件的末尾，定义了模块的初始化和退出函数，用于注册和注销设备映射器目标。
+
+项目入口
+在 Linux 内核模块中，项目入口通常是模块的初始化函数。在 dm-crypt.c 中，这个入口函数负责注册 dm-crypt 作为设备映射器的一个目标类型。以下是项目入口的关键点：
+模块初始化函数：
+通常命名为 init_module 或者使用 module_init 宏指定的函数。
+在 dm-crypt.c 中，初始化函数会调用 dm_register_target 来注册 dm-crypt 目标。
+注册设备映射器目标：
+dm_register_target 是设备映射器子系统提供的一个 API，用于注册一个新的目标类型。
+目标类型定义了如何处理 I/O 请求、如何配置和管理设备等。
+dm-crypt 目标类型的注册包括提供目标的名称、版本、配置函数、消息处理函数等。
+目标配置函数：
+这是 dm-crypt 的核心配置函数，负责解析用户提供的参数，初始化加密配置结构，设置加密算法和模式等。
+该函数通常会调用一系列辅助函数来完成具体的配置工作。
+模块退出函数：
+通常命名为 cleanup_module 或者使用 module_exit 宏指定的函数。
+在 dm-crypt.c 中，退出函数会调用 dm_unregister_target 来注销 dm-crypt 目标。
+模块信息：
+使用 MODULE_* 宏定义模块的元数据，如作者、描述、许可证等。
+核心逻辑
+1. I/O 请求处理流程：
+```c++
+static int crypt_map(struct dm_target *ti, struct bio *bio)
+{
+    // ... 初始化和验证代码 ...
+    
+    if (bio_data_dir(io->base_bio) == READ) {
+        if (kcryptd_io_read(io, GFP_NOWAIT))
+            kcryptd_queue_read(io);
+    } else
+        kcryptd_queue_crypt(io);
+}
+```
+- 所有 I/O 请求都从 crypt_map 开始处理
+  根据请求类型（读/写）分发到不同的处理队列
+  对于读请求，尝试直接处理，如果资源不足则加入队列
+  对于写请求，直接加入加密队列
+2. 加密/解密核心处理：
+```c++
+static void kcryptd_crypt(struct work_struct *work)
+{
+    if (bio_data_dir(io->base_bio) == READ)
+        kcryptd_crypt_read_convert(io);
+    else
+        kcryptd_crypt_write_convert(io);
+}
+```
+- 读操作：先解密数据，然后返回给用户
+- 写操作：先加密数据，然后写入设备
+
+3. 异步处理机制：
+```c++
+static void kcryptd_async_done(struct crypto_async_request *async_req,
+                              int error)
+{
+    // ... 错误处理 ...
+    if (!atomic_dec_and_test(&ctx->cc_pending))
+        return;
+    
+    if (bio_data_dir(io->base_bio) == READ)
+        kcryptd_crypt_read_done(io);
+    else
+        kcryptd_crypt_write_io_submit(io, 1);
+}
+```
+- 使用工作队列（workqueue）处理加密/解密请求
+- 支持异步加密操作的完成回调
+- 处理加密/解密完成后的 I/O 提交
+
+4. 内存管理：
+```c++
+static void *crypt_page_alloc(gfp_t gfp_mask, void *pool_data)
+{
+    struct crypt_config *cc = pool_data;
+    struct page *page;
+
+    if (unlikely(percpu_counter_read_positive(&cc->n_allocated_pages) >=
+                 dm_crypt_pages_per_client))
+        return NULL;
+
+    page = alloc_page(gfp_mask);
+    if (likely(page != NULL))
+        percpu_counter_add(&cc->n_allocated_pages, 1);
+
+    return page;
+}
+```
+- 使用内存池管理页面分配
+- 实现每个客户端的内存限制
+- 处理内存分配失败的情况
+
+5. IV（初始化向量）管理：
+```c++
+static int crypt_ctr_ivmode(struct dm_target *ti, const char *ivmode)
+{
+    // ... IV 模式选择和初始化 ...
+    if (ivmode == NULL)
+        cc->iv_gen_ops = NULL;
+    else if (strcmp(ivmode, "plain") == 0)
+        cc->iv_gen_ops = &crypt_iv_plain_ops;
+    else if (strcmp(ivmode, "essiv") == 0)
+        cc->iv_gen_ops = &crypt_iv_essiv_ops;
+    // ... 其他 IV 模式 ...
+}
+```
+- 支持多种 IV 生成模式
+- 每种模式都有独立的操作集
+- IV 生成与扇区号关联，确保加密安全性
+
+6. 完整性检查：
+```c++
+static int crypt_integrity_ctr(struct crypt_config *cc,
+                              struct dm_target *ti)
+{
+    // ... 完整性检查初始化 ...
+    if (crypt_integrity_aead(cc))
+        cc->integrity_iv_size = crypto_aead_ivsize(any_tfm_aead(cc));
+}
+```
+- 支持 AEAD（认证加密）模式
+- 管理完整性标签
+- 处理完整性验证失败的情况
+这些核心逻辑共同工作，确保：
+- 数据的安全加密和解密
+- 高效的 I/O 处理
+- 可靠的内存管理
+- 灵活的 IV 生成
+- 可选的数据完整性保护
+关键实现函数
+1. 初始化和配置相关函数:
+```c++
+static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+{
+    // 1. 分配配置结构
+    cc = kzalloc(sizeof(*cc), GFP_KERNEL);
+    
+    // 2. 解析参数
+    if ((r = crypt_ctr_cipher(cc, argv[0])))
+        goto bad;
+        
+    // 3. 初始化加密配置
+    if ((r = crypt_ctr_ivmode(ti, argv[1])))
+        goto bad;
+        
+    // 4. 设置工作队列
+    cc->io_queue = alloc_workqueue("kcryptd_io",
+                                  WQ_HIGHPRI |
+                                  WQ_MEM_RECLAIM,
+                                  1);
+                                  
+    // 5. 初始化内存池
+    if (crypt_alloc_tfms(cc))
+        goto bad;
+}
+```
+
+2. IV生成器相关函数:
+```c++
+// ESSIV模式IV生成
+static int crypt_iv_essiv_gen(struct crypt_config *cc, u8 *iv,
+                             struct dm_crypt_request *dmreq)
+{
+    // 使用扇区号生成IV
+    memset(iv, 0, cc->iv_size);
+    *(__le64 *)iv = cpu_to_le64(dmreq->iv_sector);
+    
+    // 使用ESSIV算法处理IV
+    return crypto_skcipher_encrypt(req);
+}
+
+// TCW模式IV生成
+static int crypt_iv_tcw_gen(struct crypt_config *cc, u8 *iv,
+                           struct dm_crypt_request *dmreq)
+{
+    // TCW特定的IV生成逻辑
+    struct iv_tcw_private *tcw = &cc->iv_gen_private.tcw;
+    return crypt_iv_tcw_whitening(cc, dmreq, data);
+}
+
+```
+3. 加密/解密核心函数:
+```c++
+static int crypt_convert_block_skcipher(struct crypt_config *cc,
+                                      struct convert_context *ctx,
+                                      struct skcipher_request *req,
+                                      unsigned int tag_offset)
+{
+    // 1. 准备输入/输出缓冲区
+    struct bio_vec bv_in = bio_iter_iovec(ctx->bio_in, ctx->iter_in);
+    struct bio_vec bv_out = bio_iter_iovec(ctx->bio_out, ctx->iter_out);
+    
+    // 2. 设置散列列表
+    sg_init_table(sg_in, 1);
+    sg_set_page(sg_in, bv_in.bv_page, cc->sector_size, bv_in.bv_offset);
+    
+    // 3. 生成IV
+    if (cc->iv_gen_ops) {
+        r = cc->iv_gen_ops->generator(cc, org_iv, dmreq);
+    }
+    
+    // 4. 执行加密/解密
+    if (bio_data_dir(ctx->bio_in) == WRITE)
+        r = crypto_skcipher_encrypt(req);
+    else
+        r = crypto_skcipher_decrypt(req);
+}
+```
+
+4. 内存管理函数:
+```c++
+static struct bio *crypt_alloc_buffer(struct dm_crypt_io *io, unsigned size)
+{
+    // 1. 分配bio结构
+    clone = bio_alloc_bioset(GFP_NOIO, nr_iovecs, &cc->bs);
+    
+    // 2. 分配页面
+    for (i = 0; i < nr_iovecs; i++) {
+        page = mempool_alloc(&cc->page_pool, gfp_mask);
+        bio_add_page(clone, page, len, 0);
+    }
+    
+    // 3. 处理完整性标签
+    if (dm_crypt_integrity_io_alloc(io, clone)) {
+        crypt_free_buffer_pages(cc, clone);
+        bio_put(clone);
+    }
+}
+```
+5. I/O请求处理函数:
+```c++
+static void kcryptd_queue_crypt(struct dm_crypt_io *io)
+{
+    struct crypt_config *cc = io->cc;
+    
+    // 1. 初始化工作
+    INIT_WORK(&io->work, kcryptd_crypt);
+    
+    // 2. 提交到工作队列
+    queue_work(cc->crypt_queue, &io->work);
+}
+
+static void kcryptd_crypt(struct work_struct *work)
+{
+    // 1. 获取IO上下文
+    struct dm_crypt_io *io = container_of(work, struct dm_crypt_io, work);
+    
+    // 2. 根据方向处理
+    if (bio_data_dir(io->base_bio) == READ)
+        kcryptd_crypt_read_convert(io);
+    else
+        kcryptd_crypt_write_convert(io);
+}
+
+```
+
+6. 完整性检查函数:
+```c++
+static int crypt_integrity_aead(struct crypt_config *cc)
+{
+    return test_bit(CRYPT_MODE_INTEGRITY_AEAD, &cc->cipher_flags);
+}
+
+static int dm_crypt_integrity_io_alloc(struct dm_crypt_io *io, struct bio *bio)
+{
+    // 1. 分配完整性载荷
+    bip = bio_integrity_alloc(bio, GFP_NOIO, 1);
+    
+    // 2. 设置标签大小
+    tag_len = io->cc->on_disk_tag_size *
+              (bio_sectors(bio) >> io->cc->sector_shift);
+              
+    // 3. 添加完整性页面
+    ret = bio_integrity_add_page(bio, virt_to_page(io->integrity_metadata),
+                                tag_len,
+                                offset_in_page(io->integrity_metadata));
+}
+```
+这些函数共同工作形成了完整的加密系统：
+- 初始化函数设置基础环境
+- IV生成器提供加密所需的初始化向量
+- 加密/解密函数处理实际数据转换
+- 内存管理函数确保资源的高效使用
+- I/O处理函数管理请求流程
+- 完整性检查函数确保数据安全性
+
+dm-crypt同步异步机制
+判断机制
+加密请求的返回值：
+- crypto_skcipher_encrypt 和 crypto_skcipher_decrypt 函数会返回不同的状态码，指示请求的处理方式。
+- -EINPROGRESS：表示请求已被排队，将异步处理。
+- 0：表示请求已同步完成。
+
+请求上下文：  
+- convert_context 结构体用于跟踪请求的状态和进度。
+- cc_pending 计数器用于跟踪当前正在处理的请求数量。
+协同工作机制
+
+请求提交：
+
+- 在 crypt_convert 函数中，首先分配请求并设置回调。
+- 根据加密模式（AEAD 或 skcipher）调用相应的加密函数。
+同步处理：
+
+- 如果加密函数返回 0，表示同步完成。
+- 直接处理加密后的数据，并更新 cc_pending 计数器。
+
+异步处理：  
+- 如果加密函数返回 -EINPROGRESS，表示请求已被排队。
+- 异步完成后，回调函数 kcryptd_async_done 会被调用。
+
+回调函数：  
+- kcryptd_async_done 负责处理异步请求完成后的操作。
+- 检查错误状态，执行必要的后处理（如 IV 更新）。
+- 减少 cc_pending 计数器，并根据请求类型继续处理。
+
+工作队列：   
+- 异步请求通过工作队列 crypt_queue 和 io_queue 进行调度。
+- kcryptd_queue_crypt 函数根据请求类型将其加入相应的工作队列。
+
+使用场景   
+- 同步加密：适用于小数据块或低延迟场景，直接在当前上下文中完成。
+- 异步加密：适用于大数据块或高并发场景，通过工作队列进行调度，避免阻塞调用线程。
+
+如何判断同步/异步
+
+关键在于 crypto_skcipher_encrypt/decrypt 的返回值，这个返回值取决于加密驱动的实现和当前的系统状态：
+```c++
+// 在 crypt_convert_block_skcipher 中：
+skcipher_request_set_crypt(req, sg_in, sg_out, cc->sector_size, iv);
+
+if (bio_data_dir(ctx->bio_in) == WRITE)
+    r = crypto_skcipher_encrypt(req);
+else
+    r = crypto_skcipher_decrypt(req);
+```
+
+重要的是，在这之前设置了请求的回调函数：
+
+```c++
+static int crypt_alloc_req_skcipher(struct crypt_config *cc,
+                                   struct convert_context *ctx)
+{
+    // ...
+    skcipher_request_set_callback(ctx->r.req, 
+        CRYPTO_TFM_REQ_MAY_BACKLOG,  // 关键标志
+        kcryptd_async_done,          // 异步完成回调
+        dmreq_of_req(cc, ctx->r.req));
+    // ...
+}
+```
+请求排队主要发生在加密子系统层面。以下是关键步骤：
+1. 请求初始化
+```c++
+static int crypto_skcipher_encrypt(struct skcipher_request *req)
+{
+    struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+    return tfm->encrypt(req);
+}
+```
+2. 加密驱动层
+```c++
+// 以 AES-NI 驱动为例
+static int aesni_encrypt(struct skcipher_request *req)
+{
+    // 检查是否可以立即处理
+    if (can_handle_now()) {
+        return process_immediately(req);
+    }
+    
+    // 无法立即处理，加入队列
+    err = crypto_transfer_request(crypto_queue, req);
+    if (err)
+        return err;
+        
+    return -EINPROGRESS;  // 表示请求已被排队
+}
+```
+
+3. 队列处理
+```c++
+static int crypto_transfer_request(struct crypto_queue *queue,
+                                 struct crypto_request *request)
+{
+    // 加入加密请求队列
+    crypto_enqueue_request(&queue->list, request);
+    
+    // 可能触发队列处理
+    crypto_queue_worker();
+    
+    return -EINPROGRESS;
+}
+```
+
+4. 异步完成处理  
+```c++
+static void kcryptd_async_done(struct crypto_async_request *async_req, int error)
+{
+    struct dm_crypt_request *dmreq = async_req->data;
+    struct convert_context *ctx = dmreq->ctx;
+    
+    // 处理完成的请求
+    if (!error && cc->iv_gen_ops && cc->iv_gen_ops->post)
+        error = cc->iv_gen_ops->post(cc, org_iv, dmreq);
+        
+    // 通知等待的进程
+    complete(&ctx->restart);
+}
+```
+5. 关键流程图
+```text
+crypt_convert_block_skcipher
+        │
+        ▼
+skcipher_request_set_crypt
+        │
+        ▼
+crypto_skcipher_encrypt/decrypt
+        │
+        ├─────────┐
+        ▼         ▼
+    同步处理    异步处理
+    返回 0     返回 -EINPROGRESS
+                    │
+                    ▼
+            加入加密请求队列
+                    │
+                    ▼
+            硬件/软件处理
+                    │
+                    ▼
+            kcryptd_async_done
+
+```
+决定同步/异步的因素
+1. 硬件状态
+```c++
+// 硬件加密引擎繁忙时会选择异步
+if (crypto_engine_busy()) {
+    return -EINPROGRESS;
+}
+```
+2. 请求队列状态
+```c++
+// 队列已满时可能强制同步
+if (crypto_queue_full()) {
+    return process_synchronously();
+}
+```
+3. 数据大小
+```c++
+// 某些驱动可能根据数据大小决定
+if (req->cryptlen > SYNC_THRESHOLD) {
+    // 选择异步处理
+    return queue_async_request();
+}
+```
+4. 系统负载
+```c++
+// 系统负载高时可能倾向于异步
+if (system_too_busy()) {
+    return -EINPROGRESS;
+}
+```
+异步加密过程
+1. 请求加入队列
+- 当加密子系统决定不能立即处理请求时，它会将请求加入一个队列。
+- 这个操作是非阻塞的，意味着调用者不需要等待加密操作完成。
+2. 队列处理
+- 加密子系统会在后台处理队列中的请求。
+- 处理完成后，会自动调用之前设置的回调函数。
+3. 回调函数 kcryptd_async_done
+- 当加密操作完成时，kcryptd_async_done 被调用。
+- 这个函数负责处理加密完成后的操作，包括：
+  - 检查加密结果（成功或失败）
+  - 释放请求相关的资源
+  - 通知上层代码加密操作已完成
+具体流程
+
+```c++
+// 异步加密请求
+static int some_cipher_encrypt(struct skcipher_request *req)
+{
+    if (can_process_immediately()) {
+        return do_encrypt_sync(req);  // 同步处理
+    } else {
+        queue_request(req);  // 异步处理
+        return -EINPROGRESS;
+    }
+}
+
+// 回调函数
+static void kcryptd_async_done(struct crypto_async_request *async_req, int error)
+{
+    struct dm_crypt_request *dmreq = async_req->data;
+    struct convert_context *ctx = dmreq->ctx;
+
+    // 检查加密结果
+    if (error) {
+        // 处理错误
+    }
+
+    // 释放资源
+    crypt_free_req(ctx->cc, req_of_dmreq(ctx->cc, dmreq), ctx->bio_in);
+
+    // 通知上层代码
+    complete(&ctx->restart);
+}
+```
+分配加密请求资源失败，为什么要发送完成信号？
+背景上下文
+
+```c++
+static blk_status_t crypt_convert(struct crypt_config *cc,
+                                 struct convert_context *ctx,
+                                 bool atomic,
+                                 bool reset_pending)
+{
+    // ... 
+    while (ctx->iter_in.bi_size && ctx->iter_out.bi_size) {
+        // 尝试分配加密请求资源
+        r = crypt_alloc_req(cc, ctx);
+        if (r) {
+            complete(&ctx->restart);
+            return BLK_STS_DEV_RESOURCE;
+        }
+        // ...
+    }
+}
+```
+完成信号的作用
+- 当加密请求资源分配失败时，complete(&ctx->restart) 会唤醒等待这个请求的其他部分代码
+- 这些代码可能在其他地方通过 wait_for_completion(&ctx->restart) 等待资源就绪
+具体场景
+
+```c++
+static void kcryptd_crypt_write_continue(struct work_struct *work)
+{
+    struct dm_crypt_io *io = container_of(work, struct dm_crypt_io, work);
+    struct crypt_config *cc = io->cc;
+    struct convert_context *ctx = &io->ctx;
+
+    // 等待完成信号
+    wait_for_completion(&ctx->restart);
+    reinit_completion(&ctx->restart);
+
+    // 继续尝试转换
+    r = crypt_convert(cc, &io->ctx, true, false);
+    // ...
+}
+```
+为什么需要这个机制
+- 防止死锁：如果资源分配失败，需要通知等待的代码放弃当前尝试
+- 资源管理：允许系统释放一些资源后重新尝试
+- 错误处理：提供一种优雅的方式来处理资源不足的情况
+dm-crypt大扇区处理方式：
+背景知识
+
+```c++
+struct crypt_config {
+    unsigned int sector_size;      // 加密扇区的大小
+    unsigned int sector_shift;     // 扇区大小的位移值
+    unsigned long cipher_flags;    // 加密标志
+    // ...
+};
+```
+目的
+- 处理大于512字节的扇区
+- 确保IV生成的正确性
+- 维护加密边界的对齐
+具体实现原理
+1. 标准扇区 vs 大扇区
+
+```c++
+// 标准扇区 = 512 bytes
+#define SECTOR_SHIFT 9  // 2^9 = 512
+
+// 大扇区示例 = 4096 bytes
+// sector_shift = 12  // 2^12 = 4096
+```
+2. IV扇区计算
+```c++
+// 对于标准512字节扇区
+dmreq->iv_sector = logical_sector;
+
+// 对于4096字节扇区
+if (test_bit(CRYPT_IV_LARGE_SECTORS, &cc->cipher_flags))
+    dmreq->iv_sector >>= cc->sector_shift - SECTOR_SHIFT;
+    // 例如：右移3位(12-9)，将4096字节扇区映射到512字节边界
+```
+
+实际应用示例
+```c++
+static int crypt_convert_block_skcipher(struct crypt_config *cc,
+                                      struct convert_context *ctx,
+                                      struct skcipher_request *req,
+                                      unsigned int tag_offset)
+{
+    struct dm_crypt_request *dmreq = dmreq_of_req(cc, req);
+    
+    // 设置IV扇区
+    dmreq->iv_sector = ctx->cc_sector;
+    
+    // 处理大扇区
+    if (test_bit(CRYPT_IV_LARGE_SECTORS, &cc->cipher_flags))
+        dmreq->iv_sector >>= cc->sector_shift;
+        
+    // 生成IV
+    if (cc->iv_gen_ops) {
+        r = cc->iv_gen_ops->generator(cc, iv, dmreq);
+        // IV生成器使用调整后的扇区号
+    }
+    // ...
+}
+```
+为什么需要这样做？
+1. 兼容性考虑
+```c++
+// 许多加密算法和工具假设使用512字节扇区
+// 需要将大扇区映射回标准扇区大小以保持兼容性
+if (using_large_sectors) {
+    sector_number >>= (large_sector_size_shift - STANDARD_SECTOR_SHIFT);
+}
+```
+
+2. IV唯一性
+```c++
+// 确保每个512字节块都有唯一的IV
+// 例如：4096字节扇区会被分成8个512字节块
+for (i = 0; i < sectors_per_block; i++) {
+    generate_iv(base_sector + i);
+    encrypt_block(data + i * 512);
+}
+```
+
+3. 对齐要求
+```c++
+// 确保加密操作在正确的边界上进行
+if (cc->sector_size > 512) {
+    // 调整对齐
+    aligned_sector = sector & ~((cc->sector_size/512) - 1);
+}
+```
+
+性能影响
+
+1. 优化
+```c++
+// 缓存扇区计算结果
+struct dm_crypt_request {
+    sector_t iv_sector;        // 已调整的扇区号
+    sector_t original_sector;  // 原始扇区号
+};
+```
+2. 内存访问
+
+``` c++
+// 减少不必要的重复计算
+if (is_power_of_2(cc->sector_size)) {
+    // 使用位移操作而不是除法
+    sector >>= cc->sector_shift;
+} else {
+    // 必须使用除法
+    sector /= (cc->sector_size >> SECTOR_SHIFT);
+}
+```
+
+这种设计允许dm-crypt:
+- 支持不同的扇区大小
+- 保持与现有加密工具的兼容性
+- 确保加密操作的正确性
+- 优化性能和资源使用
+- 通过这种方式，dm-crypt可以高效地处理各种扇区大小的设备，同时保持加密的安全性和兼容性。
+Xts-proxy概述
+我有一个疑问，我看过一篇研究，里面提到由于dm-crypt的块请求是异步的，加密过程也是异步的，因此在执行过程中，由于排队阻塞的时间反而会多，他们提出了一个优化的补丁（该补丁就在上下文中，名字是0024-Add-xtsproxy-Crypto-API-module.patch），该补丁是针对aes加密打了一个补丁，并且该补丁只对<2MB的块请求有效，补丁的效果就是最终aes加密的速度提升了200%-300%。我有以下疑问：
+1.该研究说快请求是异步的，加密也是异步的，因此进行了改善，但是好像同步异步又是通过调用的加密子模块的具体实现来决定的，我很疑惑，可以为我解答吗？
+2.该补丁的好处到底体现在哪里？我能通过优化dm-crypt模块来改善这个问题吗？
+1. 关于异步处理的问题
+
+在原始的dm-crypt设计中：  
+
+```
+// 原始设计
+struct crypt_config {
+    struct workqueue_struct *io_queue;      // IO队列
+    struct workqueue_struct *crypt_queue;   // 加密队列
+    // ...
+};
+
+// 块请求处理
+static void kcryptd_queue_read(struct dm_crypt_io *io)
+{
+    struct crypt_config *cc = io->cc;
+    INIT_WORK(&io->work, kcryptd_crypt_read_work);
+    queue_work(cc->crypt_queue, &io->work);
+}
+```
+
+问题在于：  
+- 多层异步：
+  - 块请求进入工作队列（第一层异步）
+  - 加密请求可能再次进入异步队列（第二层异步）
+  - 这种双重排队会增加延迟
+- 队列开销：
+  - 每个请求都要经过工作队列调度
+  - 上下文切换和队列管理带来额外开销
+2.  xtsproxy补丁的改进
+补丁的核心改进：
+
+```
+static struct skcipher_alg xtsproxy_skcipher = {
+    .base = {
+        .cra_name = "xts(aes)",
+        .cra_driver_name = "xts-aes-xtsproxy",
+        .cra_priority = 0,
+        .cra_blocksize = AES_BLOCK_SIZE,
+        // ...
+    },
+    .encrypt = xtsproxy_encrypt,
+    .decrypt = xtsproxy_decrypt,
+};
+
+static int xtsproxy_encrypt(struct skcipher_request *req)
+{
+    struct xtsproxy_ctx *ctx = crypto_skcipher_ctx(crypto_skcipher_reqtfm(req));
+
+    if (irq_fpu_usable())
+        skcipher_request_set_tfm(req, ctx->xts_aesni);
+    else
+        skcipher_request_set_tfm(req, ctx->xts_generic);
+
+    // 关键改进：禁止异步标志
+    req->base.flags &= ~(CRYPTO_TFM_REQ_MAY_SLEEP | 
+                        CRYPTO_TFM_REQ_MAY_BACKLOG);
+
+    return crypto_skcipher_encrypt(req);
+}
+```
+
+改进点：
+- 强制同步：对于小块请求（<2MB），强制使用同步处理
+- 避免队列：通过清除异步标志，避免请求进入队列
+- 直接执行：利用AES-NI硬件加速，直接在当前上下文执行
