@@ -1,0 +1,330 @@
+---
+title: 'VeraCrypt Params'
+date: '2024-11-26'
+tags: ['VeraCrypt']
+draft: false
+layout: PostBanner
+images: ['/static/images/banner.png']
+summary: VeraCrypt related param explained.
+
+---
+VeraCrypt的加密相关大小参数如下：
+1. 基本加密块大小定义：
+```c++
+#define BYTES_PER_XTS_BLOCK 16      // 每个XTS块16字节(128位)
+#define ENCRYPTION_DATA_UNIT_SIZE 512 // 每个加密数据单元512字节
+```
+2. 加密处理流程：
+- VeraCrypt使用XTS模式进行加密，XTS模式将数据分成固定大小的块进行处理
+- 每个XTS块大小为16字节(128位)
+- 数据以512字节为一个加密数据单元(sector)进行处理
+- 加密时会按照sector size(通常是512字节)对数据进行分块
+3. 关键代码证据：
+```c++
+// Volume.cpp中的WriteSectors函数显示写入必须按SectorSize对齐
+if (length % SectorSize != 0 || byteOffset % SectorSize != 0)
+    throw ParameterIncorrect (SRC_POS);
+
+// EncryptionModeXTS.cpp中使用ENCRYPTION_DATA_UNIT_SIZE(512字节)作为基本单位
+mode.SetSectorOffset (partitionStartOffset / ENCRYPTION_DATA_UNIT_SIZE);
+```
+4. 加密处理特点：
+- 使用XTS-AES加密模式
+- 每个数据单元(sector)独立加密
+- 支持并行处理多个数据单元
+- 使用线程池进行并行加密/解密操作
+总结：
+- XTS加密块大小: 16字节(128位)
+- 基本加密数据单元: 512字节
+- 实际操作时必须按照sector size(通常512字节)对齐
+这种设计既保证了加密的安全性(XTS模式)，又兼顾了性能(支持并行处理)。
+dm-crypt使用xts-proxy和不使用xts-proxy的调用链
+```c++
+// 设备创建阶段
+1. 使用 xtsproxy 的调用链：
+dmsetup create
+    -> ioctl(DM_DEV_CREATE)
+        -> dm_ctl_ioctl()
+            -> dev_create()
+                -> table_load()
+                    -> dm_table_add_target()
+                        -> crypt_ctr()
+                            -> crypt_ctr_cipher()
+                                -> crypto_alloc_skcipher("xts(aes)")
+                                    -> xtsproxy_skcipher_init()
+                                        -> 初始化 xts_aesni 和 xts_generic
+
+// IO处理阶段
+bio提交
+    -> generic_make_request()
+        -> dm_make_request()
+            -> __dm_make_request()
+                -> map_bio()
+                    -> crypt_map()
+                        -> kcryptd_io_read/kcryptd_queue_crypt()
+                            -> crypt_convert()
+                                -> crypto_skcipher_encrypt/decrypt()
+                                    -> xtsproxy_encrypt/decrypt() {
+                                        // 禁止队列和休眠
+                                        req->base.flags &= ~(CRYPTO_TFM_REQ_MAY_SLEEP | CRYPTO_TFM_REQ_MAY_BACKLOG);
+                                        // 直接执行加密
+                                        return crypto_skcipher_encrypt(req);
+                                    }
+```
+2. 不使用 xtsproxy 的调用链：
+```c++
+// 设备创建阶段
+dmsetup create
+    -> ioctl(DM_DEV_CREATE)
+        -> dm_ctl_ioctl()
+            -> dev_create()
+                -> table_load()
+                    -> dm_table_add_target()
+                        -> crypt_ctr()
+                            -> crypt_ctr_cipher()
+                                -> crypto_alloc_skcipher()
+                                    -> 标准xts实现初始化
+
+// IO处理阶段
+bio提交
+    -> generic_make_request()
+        -> dm_make_request()
+            -> __dm_make_request()
+                -> map_bio()
+                    -> crypt_map()
+                        -> 如果是读操作:
+                            kcryptd_io_read() {
+                                -> bio_clone_fast()
+                                -> submit_bio_noacct()
+                                -> 完成后通过crypt_endio回调
+                                    -> kcryptd_queue_crypt()
+                            }
+                        -> 如果是写操作:
+                            kcryptd_queue_crypt() {
+                                -> INIT_WORK()
+                                -> queue_work(cc->crypt_queue)
+                                    -> kcryptd_crypt()
+                                        -> crypt_convert()
+                                            -> crypto_skcipher_encrypt/decrypt()
+                                                -> 可能再次进入队列
+                                                -> 可能休眠等待资源
+                                                -> 多次上下文切换
+                            }
+```
+xtsproxy相关介绍：
+1. xtsproxy相关特点
+```c++
+struct xtsproxy_ctx {
+    struct crypto_skcipher *xts_aesni;    // 硬件加速实现
+    struct crypto_skcipher *xts_generic;   // 软件实现
+};
+
+static int xtsproxy_encrypt(struct skcipher_request *req) {
+    // 直接在当前上下文执行加密
+    if (irq_fpu_usable())
+        // 使用硬件加速
+        skcipher_request_set_tfm(req, ctx->xts_aesni);
+    else
+        // 使用软件实现
+        skcipher_request_set_tfm(req, ctx->xts_generic);
+        
+    // 禁止休眠和排队
+    req->base.flags &= ~(CRYPTO_TFM_REQ_MAY_SLEEP | CRYPTO_TFM_REQ_MAY_BACKLOG);
+    
+    return crypto_skcipher_encrypt(req);
+}
+```
+2. 关键优化点：
+同步执行：不再将请求放入队列
+硬件加速：优先使用AES-NI指令集
+避免线程切换：在当前上下文直接处理
+禁止休眠：通过清除MAY_SLEEP标志
+3. 性能提升原因：
+```c++
+performance_gains = {
+    reduced_overhead: "减少线程切换和队列操作",
+    hardware_acceleration: "利用CPU的AES-NI指令集",
+    direct_execution: "同步执行加密操作",
+    no_queuing: "避免请求排队等待"
+};
+```
+原始dm-crypt工作方式：
+![图片](/static/images/dm-crypt.png)
+
+```c++
+// 原始流程
+filesystem 
+    -> kcryptd_io (第一个工作队列)
+        -> kcryptd (第二个工作队列)
+            -> dmcrypt_write 
+                -> block device drivers
+```
+2. xts工作方式：
+```c++
+static int xtsproxy_encrypt(struct skcipher_request *req)
+{
+    // 直接在调用者的上下文中执行加密
+    if (irq_fpu_usable())
+        skcipher_request_set_tfm(req, ctx->xts_aesni);
+    else
+        skcipher_request_set_tfm(req, ctx->xts_generic);
+
+    // 禁止休眠和排队
+    req->base.flags &= ~(CRYPTO_TFM_REQ_MAY_SLEEP | CRYPTO_TFM_REQ_MAY_BACKLOG);
+
+    // 直接执行加密，不进入队列
+    return crypto_skcipher_encrypt(req);
+}
+```
+3. 关键区别：
+```c++
+original_flow = {
+    steps: [
+        "提交请求到kcryptd_io队列",
+        "切换到kcryptd_io线程",
+        "处理请求",
+        "提交到kcryptd队列",
+        "切换到kcryptd线程",
+        "执行加密",
+        "切换回原线程"
+    ]
+};
+
+new_flow = {
+    steps: [
+        "直接在当前线程执行加密",
+        "完成后继续执行"
+    ]
+};
+benefits = {
+    no_context_switch: "避免了多次上下文切换开销",
+    no_scheduling_delay: "避免了队列调度延迟",
+    no_queue_overhead: "避免了队列操作开销",
+    direct_execution: "立即执行而不是等待调度"
+};
+
+主要区别：
+differences = {
+    traditional_dm_crypt: {
+        queuing: "使用多级队列",
+        context_switches: "多次上下文切换",
+        async: "异步处理",
+        flags: "允许请求休眠和排队"
+    },
+    
+    xtsproxy: {
+        queuing: "不使用队列",
+        context_switches: "避免上下文切换",
+        sync: "同步处理",
+        flags: {
+            // 关键区别在这里
+            disabled_flags: "CRYPTO_TFM_REQ_MAY_SLEEP | CRYPTO_TFM_REQ_MAY_BACKLOG",
+            effect: "强制请求直接执行，不允许进入队列或休眠"
+        }
+    }
+};
+reasons = {
+    hardware_acceleration: "使用AES-NI硬件加速",
+    fast_execution: "加密操作足够快，不需要异步",
+    fallback_mechanism: {
+        condition: "当FPU不可用时",
+        action: "切换到通用实现",
+        still_sync: "仍然是同步执行"
+    }
+};
+```
+关键在于xtsproxy通过清除CRYPTO_TFM_REQ_MAY_SLEEP和CRYPTO_TFM_REQ_MAY_BACKLOG标志，强制加密请求在当前上下文中直接执行，而不是像传统dm-crypt那样经过多个队列和上下文切换。这种方式只有在加密操作足够快（比如使用硬件加速）时才是可行的。
+
+也就是说，通过注册了一个新的xts(aes)，绕过了原来的队列配置。但我仍不理解的是，进入crypt_convert()后，以写操作为例，最后都会调用到crypto_skcipher_encrypt()，使用xtsproxy，就是在在这里完成了同步加密的过程。不使用xtsproxy的为什么会进入队列或者休眠等待，这块在dm-crypt代码中体现，还是在所调用的内核算法中体现？
+1. 使用 xtsproxy 时：
+```c++
+static int xtsproxy_encrypt(struct skcipher_request *req)
+{
+    // 关键点1: 清除可能导致休眠和排队的标志
+    req->base.flags &= ~(CRYPTO_TFM_REQ_MAY_SLEEP | 
+                        CRYPTO_TFM_REQ_MAY_BACKLOG);
+    
+    if (irq_fpu_usable())
+        skcipher_request_set_tfm(req, ctx->xts_aesni);  // 使用硬件加速
+    else
+        skcipher_request_set_tfm(req, ctx->xts_generic); // 软件实现
+    
+    // 关键点2: 直接调用底层实现
+    return crypto_skcipher_encrypt(req);
+}
+```
+2. 不使用 xtsproxy 时：
+```c++
+// 在 crypto/skcipher.c 中
+int crypto_skcipher_encrypt(struct skcipher_request *req)
+{
+    struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+    
+    // 关键点1: 默认允许休眠和排队
+    // req->base.flags 包含 CRYPTO_TFM_REQ_MAY_SLEEP | CRYPTO_TFM_REQ_MAY_BACKLOG
+    
+    // 关键点2: 可能使用异步实现
+    if (crypto_skcipher_get_flags(tfm) & CRYPTO_TFM_NEED_KEY)
+        return -ENOKEY;
+        
+    return tfm->encrypt(req);  // 调用具体算法实现
+}
+
+// 在具体的加密实现中 (例如 crypto/xts.c)
+static int xts_encrypt(struct skcipher_request *req)
+{
+    // 可能会:
+    // 1. 分配内存 (可能休眠)
+    // 2. 等待硬件资源 (可能休眠)
+    // 3. 使用工作队列进行异步处理
+    ...
+}
+```
+关键区别体现在三个层面：
+1. 标志位控制：
+```c++
+struct skcipher_request {
+    struct crypto_async_request base;  // 包含标志位
+    // ...
+};
+
+// xtsproxy: 强制同步
+req->base.flags &= ~(CRYPTO_TFM_REQ_MAY_SLEEP | CRYPTO_TFM_REQ_MAY_BACKLOG);
+
+// 标准实现: 允许异步
+// 保留 CRYPTO_TFM_REQ_MAY_SLEEP | CRYPTO_TFM_REQ_MAY_BACKLOG 标志
+```
+2. 内核加密框架层：
+```c++
+// crypto/api.c
+int crypto_enqueue_request(struct crypto_queue *queue,
+                          struct crypto_async_request *request)
+{
+    // 如果请求允许排队(有CRYPTO_TFM_REQ_MAY_BACKLOG标志)
+    if (queue->backlog == &backlog && request->flags & CRYPTO_TFM_REQ_MAY_BACKLOG)
+        queue = &backlog;
+        
+    // 标准实现可能进入队列
+    // xtsproxy因为清除了标志，不会进入这个分支
+}
+```
+3. 具体算法实现层：
+```c++
+// crypto/xts.c (标准实现)
+static int xts_encrypt(struct skcipher_request *req)
+{
+    // 可能会调用 kmalloc(GFP_KERNEL) - 允许休眠
+    // 可能会等待硬件资源
+    if (req->flags & CRYPTO_TFM_REQ_MAY_SLEEP) {
+        // 进行可能休眠的操作
+    }
+}
+
+// xtsproxy的实现
+static int xtsproxy_encrypt(struct skcipher_request *req)
+{
+    // 直接使用AES-NI或软件实现
+    // 不会休眠或进入队列
+    return aesni_encrypt_xts(req);
+}
+```

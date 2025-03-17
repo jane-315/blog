@@ -1,0 +1,218 @@
+---
+title: 'XTS Proxy'
+date: '2024-12-25'
+tags: ['fuse']
+draft: false
+layout: PostBanner
+images: ['/static/images/banner.png']
+summary: xts-proxy.
+---
+xts-proxy补丁本身并不是直接改变了dm-crypt的运行逻辑，而是提供了一个新的XTS-AES加密实现方式。让我解释一下：
+原始dm-crypt流程 (图一所示):
+```c++
+
+filesystem -> kcryptd_io -> kcryptd -> dmcrypt_write -> block device drivers
+// 原始流程
+filesystem 
+    -> kcryptd_io (第一个工作队列)
+        -> kcryptd (第二个工作队列)
+            -> dmcrypt_write 
+                -> block device drivers
+在这个流程中，每次IO请求都要：
+先进入kcryptd_io队列等待处理
+然后转交给kcryptd队列进行加密
+最后才写入设备
+每个队列都意味着线程切换和上下文切换
+```
+这个流程中包含了多次线程切换和队列操作。
+xtsproxy的实现特点：
+```c++
+struct xtsproxy_ctx {
+    struct crypto_skcipher *xts_aesni;    // 硬件加速实现
+    struct crypto_skcipher *xts_generic;   // 软件实现
+};
+
+static int xtsproxy_encrypt(struct skcipher_request *req) {
+    // 直接在当前上下文执行加密
+    if (irq_fpu_usable())
+        // 使用硬件加速
+        skcipher_request_set_tfm(req, ctx->xts_aesni);
+    else
+        // 使用软件实现
+        skcipher_request_set_tfm(req, ctx->xts_generic);
+        
+    // 禁止休眠和排队
+    req->base.flags &= ~(CRYPTO_TFM_REQ_MAY_SLEEP | CRYPTO_TFM_REQ_MAY_BACKLOG);
+    
+    return crypto_skcipher_encrypt(req);
+}
+```
+关键区别：
+```c++
+original_flow = {
+    steps: [
+        "提交请求到kcryptd_io队列",
+        "切换到kcryptd_io线程",
+        "处理请求",
+        "提交到kcryptd队列",
+        "切换到kcryptd线程",
+        "执行加密",
+        "切换回原线程"
+    ]
+};
+new_flow = {
+    steps: [
+        "直接在当前线程执行加密",
+        "完成后继续执行"
+    ]
+};
+```
+m-crypt使用xts-proxy和不使用xts-proxy的调用链
+1. 使用 xtsproxy 的调用链：
+```c++
+// 设备创建阶段
+dmsetup create
+    -> ioctl(DM_DEV_CREATE)
+        -> dm_ctl_ioctl()
+            -> dev_create()
+                -> table_load()
+                    -> dm_table_add_target()
+                        -> crypt_ctr()
+                            -> crypt_ctr_cipher()
+                                -> crypto_alloc_skcipher("xts(aes)")
+                                    -> xtsproxy_skcipher_init()
+                                        -> 初始化 xts_aesni 和 xts_generic
+
+// IO处理阶段
+bio提交
+    -> generic_make_request()
+        -> dm_make_request()
+            -> __dm_make_request()
+                -> map_bio()
+                    -> crypt_map()
+                        -> kcryptd_io_read/kcryptd_queue_crypt()
+                            -> crypt_convert()
+                                -> crypto_skcipher_encrypt/decrypt()
+                                    -> xtsproxy_encrypt/decrypt() {
+                                        // 禁止队列和休眠
+                                        req->base.flags &= ~(CRYPTO_TFM_REQ_MAY_SLEEP | CRYPTO_TFM_REQ_MAY_BACKLOG);
+                                        // 直接执行加密
+                                        return crypto_skcipher_encrypt(req);
+                                    }
+```
+2. 不使用 xtsproxy 的调用链：
+```c++
+// 设备创建阶段
+dmsetup create
+    -> ioctl(DM_DEV_CREATE)
+        -> dm_ctl_ioctl()
+            -> dev_create()
+                -> table_load()
+                    -> dm_table_add_target()
+                        -> crypt_ctr()
+                            -> crypt_ctr_cipher()
+                                -> crypto_alloc_skcipher()
+                                    -> 标准xts实现初始化
+
+// IO处理阶段
+bio提交
+    -> generic_make_request()
+        -> dm_make_request()
+            -> __dm_make_request()
+                -> map_bio()
+                    -> crypt_map()
+                        -> 如果是读操作:
+                            kcryptd_io_read() {
+                                -> bio_clone_fast()
+                                -> submit_bio_noacct()
+                                -> 完成后通过crypt_endio回调
+                                    -> kcryptd_queue_crypt()
+                            }
+                        -> 如果是写操作:
+                            kcryptd_queue_crypt() {
+                                -> INIT_WORK()
+                                -> queue_work(cc->crypt_queue)
+                                    -> kcryptd_crypt()
+                                        -> crypt_convert()
+                                            -> crypto_skcipher_encrypt/decrypt()
+                                                -> 可能再次进入队列
+                                                -> 可能休眠等待资源
+                                                -> 多次上下文切换
+                            }
+```
+以下是对每条指令的逐步解释：
+
+
+---
+
+1. ```sudo modprobe brd rd_nr=1 rd_size=4194304```
+- 作用：加载 `brd`（block RAM disk）内核模块，并创建一个 RAM 磁盘。
+- 参数：
+  - rd_nr=1: 创建一个 RAM 磁盘设备，设备号为 /dev/ram0。
+  - rd_size=4194304: 指定 RAM 磁盘的大小，单位是 **块（block）**，每块大小为 512 字节。计算如下：
+  ```
+  4194304 blocks × 512 bytes = 2 GB
+  ```
+  - 结果：创建一个大小为 2 GB 的虚拟块设备 /dev/ram0，它将占用等量的内存，但模拟成一个普通磁盘设备。
+
+
+---
+
+2. echo '0 8388608 delay /dev/ram0 0 0' | sudo dmsetup create plain
+- 作用：使用 dmsetup（device mapper 工具）创建一个基于 /dev/ram0 的虚拟设备，名称为 plain。
+- 参数解析：
+  - 0 8388608: 定义映射区域的起始和长度。
+    - 0: 起始扇区号。
+    - 8388608: 长度，单位是扇区（每扇区 512 字节）。计算如下：
+    ```
+    8388608 sectors × 512 bytes = 4 GB
+    ```
+    - 这里比 RAM 磁盘的大小 2 GB 大了两倍，实际上会受限于 /dev/ram0 的物理大小。
+  - delay: 使用 Device Mapper 的 delay 表类型，可以延迟读写操作。
+    - /dev/ram0: 指定底层物理设备。
+    - 0 0: 读写操作的延迟时间（以微秒为单位），这里延迟为 0，表示没有延迟。
+- 结果：创建了一个名为 /dev/mapper/plain 的虚拟设备，映射到 /dev/ram0。
+
+
+---
+
+3. sudo cryptsetup luksFormat /dev/mapper/plain
+- 作用：在 plain 设备上创建一个 LUKS（Linux Unified Key Setup）加密分区。
+- 参数解析：
+  - /dev/mapper/plain: 指定要加密的设备。
+- 执行过程：
+  - 该命令会初始化 plain 设备，写入加密元数据，并创建一个加密分区。
+  - 执行时会要求你输入加密密码。
+  - 通过该密码保护加密分区中的数据。
+- 结果：/dev/mapper/plain 被格式化为一个加密分区，不能直接访问，只有通过解密后才能使用。
+
+
+---
+
+4. sudo cryptsetup open --type luks /dev/mapper/plain secure
+- 作用：打开 plain 设备上的 LUKS 加密分区，并解密它。
+- 参数解析：
+  - --type luks: 指定分区类型为 LUKS。
+  - /dev/mapper/plain: 要解密的加密设备。
+  - secure: 解密后映射出的设备名，映射结果为 /dev/mapper/secure。
+- 执行过程：
+  - 提示输入加密密码。
+  - 验证通过后，创建一个解密后的虚拟设备 /dev/mapper/secure，可以像普通磁盘一样访问。
+- 结果：现在可以通过 /dev/mapper/secure 访问解密后的存储内容。
+
+
+---
+
+总结执行后的设备关系
+1. /dev/ram0: 最底层 RAM 磁盘设备，模拟的内存块设备。
+2. /dev/mapper/plain: 基于 /dev/ram0 的 Device Mapper 虚拟设备，未加密时直接映射到 /dev/ram0。
+3. /dev/mapper/secure: 解密后的虚拟设备，用户可以在这个设备上读写加密后的数据。
+
+
+---
+
+用途
+以上步骤常用于测试加密存储的性能和功能，或者模拟一个加密磁盘的使用场景：
+- modprobe brd: 创建一个临时的 RAM 磁盘，作为存储设备。
+- dmsetup: 用 Device Mapper 创建一个虚拟设备，可能还会测试延迟等功能。
+- cryptsetup: 为虚拟设备加密并测试加密相关功能。
