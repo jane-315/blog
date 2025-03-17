@@ -830,7 +830,7 @@ if (test_bit(CRYPT_IV_LARGE_SECTORS, &cc->cipher_flags))
 static int crypt_convert_block_skcipher(struct crypt_config *cc,
                                       struct convert_context *ctx,
                                       struct skcipher_request *req,
-                                      unsigned int tag_offset)
+                                    unsigned int tag_offset)
 {
     struct dm_crypt_request *dmreq = dmreq_of_req(cc, req);
     
@@ -908,7 +908,7 @@ if (is_power_of_2(cc->sector_size)) {
 - 优化性能和资源使用
 - 通过这种方式，dm-crypt可以高效地处理各种扇区大小的设备，同时保持加密的安全性和兼容性。
 Xts-proxy概述
-我有一个疑问，我看过一篇研究，里面提到由于dm-crypt的块请求是异步的，加密过程也是异步的，因此在执行过程中，由于排队阻塞的时间反而会多，他们提出了一个优化的补丁（该补丁就在上下文中，名字是0024-Add-xtsproxy-Crypto-API-module.patch），该补丁是针对aes加密打了一个补丁，并且该补丁只对<2MB的块请求有效，补丁的效果就是最终aes加密的速度提升了200%-300%。我有以下疑问：
+我有一个疑问，我看过一篇研究，里面提到由于dm-crypt的块请求是异步的，加密过程也是异步的，因此在执行过程中，由于排队阻塞的时间反而会多，他们提出了一个优化的补丁（该补丁就在上下文中，名字是0024-Add-xtsproxy-Crypto-API-module.patch），该补丁是针对aes加密打了一个补丁，并且该补丁只对\<2MB的块请求有效，补丁的效果就是最终aes加密的速度提升了200%-300%。我有以下疑问：
 1.该研究说快请求是异步的，加密也是异步的，因此进行了改善，但是好像同步异步又是通过调用的加密子模块的具体实现来决定的，我很疑惑，可以为我解答吗？
 2.该补丁的好处到底体现在哪里？我能通过优化dm-crypt模块来改善这个问题吗？
 1. 关于异步处理的问题
@@ -974,6 +974,6 @@ static int xtsproxy_encrypt(struct skcipher_request *req)
 ```
 
 改进点：
-- 强制同步：对于小块请求（<2MB），强制使用同步处理
+- 强制同步：对于小块请求（\<2MB），强制使用同步处理
 - 避免队列：通过清除异步标志，避免请求进入队列
 - 直接执行：利用AES-NI硬件加速，直接在当前上下文执行
